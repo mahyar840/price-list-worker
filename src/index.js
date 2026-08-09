@@ -1,20 +1,13 @@
 /**
- * Price List Worker -- the "brain"
- * =================================
+ * Price List Worker -- KV-free version
+ * =====================================
+ * Single bot, single Worker. Config comes straight from env vars/secrets
+ * (no BOT_CONFIG KV needed). Queued photos use the Workers Cache API
+ * (no SESSIONS KV needed either -- no KV namespace required AT ALL).
+ *
  * Overlays real OCR'd price data onto a FIXED, hand-approved graphic
  * template (assets/template-empty.png) instead of generating graphics
- * on every request. This is deliberate:
- *   - Image-generation models cannot be trusted to render exact numbers
- *     (they hallucinate digits). So the template's graphics (logos, bars,
- *     colors, banner) are generated ONCE, approved by a human, and then
- *     NEVER regenerated again.
- *   - Every subsequent price list just draws real, OCR'd text on top of
- *     that same fixed image. The graphics can never drift from what was
- *     approved; only the data changes.
- *
- * Multi-bot pattern: this one Worker can be the brain for many Telegram
- * bots. Each bot's webhook points at /webhook/<botId>. Bot config lives in
- * the BOT_CONFIG KV namespace. See README.md.
+ * on every request -- see README.md for why.
  */
 
 import satori from "satori";
@@ -66,29 +59,21 @@ function todayJalaliStr() {
 }
 
 // ---------------------------------------------------------------------------
-// TEMPLATE COORDINATE MAP
+// TEMPLATE COORDINATE MAP (unchanged from before)
 // ---------------------------------------------------------------------------
-// Pixel-measured (by scanning bar colors) against assets/template-empty.png
-// at its native 1536x1024 resolution. Each category can have MORE THAN ONE
-// box (e.g. Samsung watches has two separate regions in the template) --
-// items fill the first box, then overflow into the next box in the list,
-// in order. If still more items than total box capacity, extras are
-// DROPPED (never shrink the font -- per explicit instruction).
 
 const TEMPLATE_W = 1536;
 const TEMPLATE_H = 1024;
-const ROW_H = 20;       // fixed row height -- never changes
-const FONT_SIZE = 13;    // fixed font size -- never changes
-const BOX_PAD = 10;      // inner padding from each box's own edges
+const ROW_H = 20;
+const FONT_SIZE = 13;
+const BOX_PAD = 10;
 
 const CATEGORY_BOXES = {
   "هدفون بلوتوث شیائومی": [{ x0: 20, x1: 322, y0: 171, y1: 255 }],
   "ساعت هوشمند شیائومی": [{ x0: 20, x1: 322, y0: 292, y1: 397 }],
   "پاور بانک شیائومی": [{ x0: 20, x1: 322, y0: 434, y1: 540 }],
   "کابل و شارژر شیائومی": [{ x0: 20, x1: 322, y0: 577, y1: 908 }],
-
   "هندزفری بلوتوث سامسونگ": [{ x0: 350, x1: 672, y0: 251, y1: 309 }],
-  // shared category -- two non-contiguous boxes (see note above)
   "ساعت هوشمند سامسونگ": [
     { x0: 350, x1: 672, y0: 344, y1: 420 },
     { x0: 350, x1: 672, y0: 856, y1: 908 },
@@ -97,7 +82,6 @@ const CATEGORY_BOXES = {
   "لوازم جانبی سامسونگ": [{ x0: 350, x1: 672, y0: 565, y1: 639 }],
   "کیف های حمل سامسونگ": [{ x0: 350, x1: 672, y0: 675, y1: 739 }],
   "هدفون و هندزفری بی سیم سامسونگ": [{ x0: 350, x1: 672, y0: 776, y1: 820 }],
-
   "اسپیکر انکر": [{ x0: 696, x1: 988, y0: 170, y1: 293 }],
   "هدفون و هندزفری بلوتوث انکر": [{ x0: 696, x1: 988, y0: 328, y1: 434 }],
   "پاور بانک انکر": [{ x0: 696, x1: 988, y0: 470, y1: 561 }],
@@ -109,28 +93,28 @@ const CATEGORY_BOXES = {
 const KNOWN_CATEGORIES = Object.keys(CATEGORY_BOXES);
 
 // ---------------------------------------------------------------------------
-// Bot config + session helpers (KV)
+// Session (queued photos) via Cache API -- NO KV NEEDED
 // ---------------------------------------------------------------------------
+// This is a best-effort, short-lived cache (not guaranteed permanent like
+// KV), which is fine for "send photos, then hit /generate a bit later".
 
-async function getBotConfig(env, botId) {
-  const raw = await env.BOT_CONFIG.get(`bot:${botId}`);
-  if (!raw) return null;
-  return JSON.parse(raw);
-  // Expected shape:
-  // { "telegramToken": "...", "defaultMargin": 20 }
-  // (shopName/phone/banner are now baked into the template image itself,
-  // so they're no longer needed in config.)
+function sessionCacheKey(chatId) {
+  return new Request(`https://price-list-worker.internal/session/${chatId}`);
 }
 
-async function getSession(env, botId, chatId) {
-  const raw = await env.SESSIONS.get(`sess:${botId}:${chatId}`);
-  return raw ? JSON.parse(raw) : { photos: [], margin: null };
+async function getSession(chatId) {
+  const cache = caches.default;
+  const hit = await cache.match(sessionCacheKey(chatId));
+  if (!hit) return { photos: [], margin: null };
+  return await hit.json();
 }
 
-async function setSession(env, botId, chatId, session) {
-  await env.SESSIONS.put(`sess:${botId}:${chatId}`, JSON.stringify(session), {
-    expirationTtl: 3600,
+async function setSession(chatId, session) {
+  const cache = caches.default;
+  const res = new Response(JSON.stringify(session), {
+    headers: { "Cache-Control": "max-age=3600", "Content-Type": "application/json" },
   });
+  await cache.put(sessionCacheKey(chatId), res);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,43 +246,23 @@ function applyMargin(items, marginPercent) {
 // ---------------------------------------------------------------------------
 // Render step -- overlay text on the fixed template image via satori+resvg
 // ---------------------------------------------------------------------------
+// No KV cache here anymore -- just fetched fresh each cold start. A Worker
+// isolate stays warm for many requests in a row, so this only costs a bit
+// of extra time occasionally, not on every single message.
 
-const fontBytesCache = {};
 async function loadFont(env, bold) {
-  const key = bold ? "bold" : "regular";
-  if (fontBytesCache[key]) return fontBytesCache[key];
-  const kvKey = `font:vazirmatn:${key}`;
-  const cached = await env.BOT_CONFIG.get(kvKey, "arrayBuffer");
-  if (cached) { fontBytesCache[key] = cached; return cached; }
   const url = bold ? env.FONT_URL_BOLD : env.FONT_URL_REGULAR;
   const res = await fetch(url);
-  const buf = await res.arrayBuffer();
-  await env.BOT_CONFIG.put(kvKey, buf);
-  fontBytesCache[key] = buf;
-  return buf;
+  return res.arrayBuffer();
 }
 
-let templateB64Cache = null;
 async function loadTemplateDataUri(env) {
-  if (templateB64Cache) return templateB64Cache;
-  const cached = await env.BOT_CONFIG.get("template:main", "arrayBuffer");
-  let buf;
-  if (cached) {
-    buf = cached;
-  } else {
-    const res = await fetch(env.TEMPLATE_URL);
-    buf = await res.arrayBuffer();
-    await env.BOT_CONFIG.put("template:main", buf);
-  }
+  const res = await fetch(env.TEMPLATE_URL);
+  const buf = await res.arrayBuffer();
   const b64 = bytesToBase64(new Uint8Array(buf));
-  templateB64Cache = `data:image/png;base64,${b64}`;
-  return templateB64Cache;
+  return `data:image/png;base64,${b64}`;
 }
 
-/** Group items by category, split into their pre-defined boxes, and drop
- *  any item that doesn't fit (font/row size never changes). Returns an
- *  array of { x0,y0,x1,y1, rows: [{name,color,price}] } ready to draw,
- *  plus counts of what got skipped so the caller can report back. */
 function layoutItemsIntoBoxes(items) {
   const byCategory = new Map();
   let uncategorized = 0;
@@ -385,8 +349,9 @@ async function renderPriceListPng(env, items) {
 // Webhook handler
 // ---------------------------------------------------------------------------
 
-async function handleUpdate(env, botId, config, update) {
-  const token = config.telegramToken;
+async function handleUpdate(env, update) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const defaultMargin = parseFloat(env.DEFAULT_MARGIN || "20");
   const msg = update.message;
   if (!msg) return;
   const chatId = msg.chat.id;
@@ -394,7 +359,7 @@ async function handleUpdate(env, botId, config, update) {
   if (msg.text === "/start") {
     await tgSendMessage(token, chatId,
       "سلام! عکس لیست قیمت تامین‌کننده رو بفرست (چند تا هم می‌تونی پشت سر هم بفرستی)، بعد /generate رو بزن.\n" +
-      `درصد سود پیش‌فرض: ${config.defaultMargin}% -- برای تغییرش: /setmargin 25`);
+      `درصد سود پیش‌فرض: ${defaultMargin}% -- برای تغییرش: /setmargin 25`);
     return;
   }
 
@@ -405,15 +370,15 @@ async function handleUpdate(env, botId, config, update) {
       await tgSendMessage(token, chatId, "مثال درست: /setmargin 25");
       return;
     }
-    const session = await getSession(env, botId, chatId);
+    const session = await getSession(chatId);
     session.margin = val;
-    await setSession(env, botId, chatId, session);
+    await setSession(chatId, session);
     await tgSendMessage(token, chatId, `درصد سود روی ${val}% تنظیم شد.`);
     return;
   }
 
   if (msg.text === "/generate") {
-    const session = await getSession(env, botId, chatId);
+    const session = await getSession(chatId);
     if (!session.photos.length) {
       await tgSendMessage(token, chatId, "هنوز عکسی نفرستادی.");
       return;
@@ -431,11 +396,11 @@ async function handleUpdate(env, botId, config, update) {
     if (!allItems.length) {
       await tgSendMessage(token, chatId, "هیچ کالای موجودی استخراج نشد.");
       session.photos = [];
-      await setSession(env, botId, chatId, session);
+      await setSession(chatId, session);
       return;
     }
 
-    const margin = session.margin ?? config.defaultMargin;
+    const margin = session.margin ?? defaultMargin;
     const priced = applyMargin(allItems, margin);
     const { png, dropped, uncategorized } = await renderPriceListPng(env, priced);
 
@@ -445,15 +410,15 @@ async function handleUpdate(env, botId, config, update) {
 
     await tgSendPhoto(token, chatId, png, caption);
     session.photos = [];
-    await setSession(env, botId, chatId, session);
+    await setSession(chatId, session);
     return;
   }
 
   if (msg.photo && msg.photo.length) {
     const best = msg.photo[msg.photo.length - 1];
-    const session = await getSession(env, botId, chatId);
+    const session = await getSession(chatId);
     session.photos.push(best.file_id);
-    await setSession(env, botId, chatId, session);
+    await setSession(chatId, session);
     await tgSendMessage(token, chatId, `عکس دریافت شد (${session.photos.length} عکس تو صف). وقتی تموم شد /generate رو بزن.`);
     return;
   }
@@ -462,16 +427,11 @@ async function handleUpdate(env, botId, config, update) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/webhook\/([a-zA-Z0-9_-]+)$/);
-    if (!match || request.method !== "POST") {
+    if (url.pathname !== "/webhook" || request.method !== "POST") {
       return new Response("not found", { status: 404 });
     }
-    const botId = match[1];
-    const config = await getBotConfig(env, botId);
-    if (!config) return new Response("unknown bot", { status: 404 });
-
     const update = await request.json();
-    ctx.waitUntil(handleUpdate(env, botId, config, update));
+    ctx.waitUntil(handleUpdate(env, update));
     return new Response("ok");
   },
 };
