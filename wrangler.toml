@@ -14,3 +14,5 @@ TEMPLATE_URL = "https://raw.githubusercontent.com/mahyar840/price-list-worker/re
 
 # TELEGRAM_BOT_TOKEN و ANTHROPIC_API_KEY رو به‌صورت Secret از داشبورد اضافه
 # می‌کنی (نه اینجا) -- مرحله‌ی بعدی راهنماییت می‌کنم.
+[ai]
+binding = "AI"
