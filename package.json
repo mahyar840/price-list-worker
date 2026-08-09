@@ -1,0 +1,16 @@
+{
+  "name": "price-list-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "satori": "^0.10.13",
+    "@resvg/resvg-wasm": "^2.6.2"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
