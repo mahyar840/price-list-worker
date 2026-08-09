@@ -3,24 +3,14 @@ main = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# BOT_CONFIG holds per-bot config, the cached fonts, AND the cached template
-# image (fetched once, then reused forever -- see README).
-[[kv_namespaces]]
-binding = "BOT_CONFIG"
-id = "REPLACE_WITH_KV_ID"
-
-# SESSIONS holds per-chat queued photos / margin override.
-[[kv_namespaces]]
-binding = "SESSIONS"
-id = "REPLACE_WITH_KV_ID"
-
+# هیچ KV لازم نیست -- همه‌چی از همین متغیرها میاد.
 [vars]
+DEFAULT_MARGIN = "20"
 FONT_URL_REGULAR = "https://raw.githubusercontent.com/rastikerdar/vazirmatn/main/fonts/ttf/Vazirmatn-Regular.ttf"
 FONT_URL_BOLD = "https://raw.githubusercontent.com/rastikerdar/vazirmatn/main/fonts/ttf/Vazirmatn-Bold.ttf"
 
-# Raw URL to the approved, fixed graphic template (assets/template-empty.png
-# in this repo). After you push to GitHub, this will be something like:
-# https://raw.githubusercontent.com/<you>/<repo>/main/assets/template-empty.png
-TEMPLATE_URL = "REPLACE_WITH_YOUR_GITHUB_RAW_URL"
+# لینک raw همون عکس قالب که تو گیت‌هابت آپلود کردی
+TEMPLATE_URL = "https://raw.githubusercontent.com/mahyar840/price-list-worker/refs/heads/main/assets/template-empty.png"
 
-# ANTHROPIC_API_KEY is a secret -- add it from the dashboard, see README.md.
+# TELEGRAM_BOT_TOKEN و ANTHROPIC_API_KEY رو به‌صورت Secret از داشبورد اضافه
+# می‌کنی (نه اینجا) -- مرحله‌ی بعدی راهنماییت می‌کنم.
