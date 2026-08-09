@@ -424,9 +424,52 @@ async function handleUpdate(env, update) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// TEMPORARY test route -- free OCR accuracy test via Workers AI.
+// Visit: https://<your-worker>.workers.dev/test-ocr?url=<raw image URL>
+// Remove this whole block once the test is done.
+// ---------------------------------------------------------------------------
+const TEST_OCR_PROMPT = `این یه لیست قیمت فارسیه. همه‌ی کالاهای موجود و قیمتشون رو دقیقاً همون‌طور که تو عکس نوشته شده استخراج کن.
+قوانین:
+- هر ردیفی که قیمتش *** یا خالیه یا نامشخصه رو رد کن (نیار تو خروجی)
+- اگه دو تا قیمت بود (نقدی/تسویه)، فقط عدد کمتر (نقدی) رو بردار
+- هیچ عددی از خودت نساز؛ مطمئن نبودی، رد کن
+خروجی رو فقط یه آرایه‌ی JSON بده، بدون توضیح، بدون \`\`\`، هر آیتم: {"name":"...","color":"...","price":عدد}`;
+
+async function handleTestOcr(env, imageUrl) {
+  try {
+    const result = await env.AI.run("@cf/mistralai/mistral-small-3.1-24b-instruct", {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: TEST_OCR_PROMPT },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+    });
+    return new Response(JSON.stringify(result, null, 2), {
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  } catch (err) {
+    return new Response(`ERROR: ${err.message}\n\n${err.stack || ""}`, {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/test-ocr") {
+      const imageUrl = url.searchParams.get("url");
+      if (!imageUrl) return new Response("add ?url=<image link> to the address", { status: 400 });
+      return handleTestOcr(env, imageUrl);
+    }
+
     if (url.pathname !== "/webhook" || request.method !== "POST") {
       return new Response("not found", { status: 404 });
     }
