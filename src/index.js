@@ -188,30 +188,31 @@ Rules:
 
 async function ocrImageToItems(apiKey, imageBytes) {
   const b64 = bytesToBase64(imageBytes);
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      system: OCR_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: b64 } },
-            { type: "text", text: "Extract the available products, categorized, from this price list image as JSON." },
-          ],
-        },
-      ],
-    }),
-  });
+  const res = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: OCR_SYSTEM_PROMPT },
+              { inline_data: { mime_type: "image/png", data: b64 } },
+            ],
+          },
+        ],
+        generationConfig: { maxOutputTokens: 8192 },
+      }),
+    }
+  );
   const data = await res.json();
-  let text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("").trim();
+  let text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+  text = text.trim();
   if (text.startsWith("```")) {
     text = text.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
   }
@@ -388,7 +389,7 @@ async function handleUpdate(env, update) {
     let allItems = [];
     for (const fileId of session.photos) {
       const bytes = await tgDownloadFile(token, fileId);
-      const items = await ocrImageToItems(env.ANTHROPIC_API_KEY, bytes);
+      const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes);
       allItems = allItems.concat(items);
     }
     allItems = dedupeItems(allItems);
@@ -421,43 +422,6 @@ async function handleUpdate(env, update) {
     await setSession(chatId, session);
     await tgSendMessage(token, chatId, `عکس دریافت شد (${session.photos.length} عکس تو صف). وقتی تموم شد /generate رو بزن.`);
     return;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// TEMPORARY test route -- free OCR accuracy test via Workers AI.
-// Visit: https://<your-worker>.workers.dev/test-ocr?url=<raw image URL>
-// Remove this whole block once the test is done.
-// ---------------------------------------------------------------------------
-const TEST_OCR_PROMPT = `این یه لیست قیمت فارسیه. همه‌ی کالاهای موجود و قیمتشون رو دقیقاً همون‌طور که تو عکس نوشته شده استخراج کن.
-قوانین:
-- هر ردیفی که قیمتش *** یا خالیه یا نامشخصه رو رد کن (نیار تو خروجی)
-- اگه دو تا قیمت بود (نقدی/تسویه)، فقط عدد کمتر (نقدی) رو بردار
-- هیچ عددی از خودت نساز؛ مطمئن نبودی، رد کن
-خروجی رو فقط یه آرایه‌ی JSON بده، بدون توضیح، بدون \`\`\`، هر آیتم: {"name":"...","color":"...","price":عدد}`;
-
-async function handleTestOcr(env, imageUrl) {
-  try {
-    const result = await env.AI.run("@cf/mistralai/mistral-small-3.1-24b-instruct", {
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: TEST_OCR_PROMPT },
-            { type: "image_url", image_url: { url: imageUrl } },
-          ],
-        },
-      ],
-      max_tokens: 4096,
-    });
-    return new Response(JSON.stringify(result, null, 2), {
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-    });
-  } catch (err) {
-    return new Response(`ERROR: ${err.message}\n\n${err.stack || ""}`, {
-      status: 500,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
   }
 }
 
