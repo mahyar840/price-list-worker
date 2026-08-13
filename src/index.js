@@ -186,40 +186,60 @@ Rules:
   "color": "<color/variant if shown, else empty string>",
   "price": <integer, no separators>}`;
 
-async function ocrImageToItems(apiKey, imageBytes) {
+async function ocrImageToItems(apiKey, imageBytes, onProgress) {
   const b64 = bytesToBase64(imageBytes);
-  const res = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: OCR_SYSTEM_PROMPT },
-              { inline_data: { mime_type: "image/png", data: b64 } },
-            ],
-          },
-        ],
-        generationConfig: { maxOutputTokens: 8192 },
-      }),
-    }
-  );
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s hard timeout
+  let res;
+  try {
+    if (onProgress) await onProgress("در حال ارسال عکس به هوش مصنوعی برای خوندن... 🤖");
+    res = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: OCR_SYSTEM_PROMPT },
+                { inline_data: { mime_type: "image/png", data: b64 } },
+              ],
+            },
+          ],
+          generationConfig: { maxOutputTokens: 8192 },
+        }),
+        signal: controller.signal,
+      }
+    );
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (onProgress) await onProgress(`⛔ خطا موقع صدا زدن Gemini: ${err.message} (شاید timeout خورده، ۴۵ ثانیه صبر کردیم)`);
+    return [];
+  }
+  clearTimeout(timeoutId);
+  if (onProgress) await onProgress(`جواب از Gemini رسید (کد وضعیت: ${res.status}) ⏳ در حال پردازش...`);
   const data = await res.json();
-  console.log("GEMINI RAW RESPONSE:", JSON.stringify(data).slice(0, 2000));
+  if (data.error) {
+    if (onProgress) await onProgress(`⛔ Gemini خطا داد: ${JSON.stringify(data.error).slice(0, 300)}`);
+    return [];
+  }
   let text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
   text = text.trim();
-  console.log("GEMINI EXTRACTED TEXT:", text.slice(0, 500));
+  if (!text) {
+    if (onProgress) await onProgress(`⚠️ Gemini جواب خالی داد. finishReason: ${data?.candidates?.[0]?.finishReason || "نامشخص"}`);
+    return [];
+  }
   if (text.startsWith("```")) {
     text = text.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
   }
   try {
     const items = JSON.parse(text);
+    if (onProgress) await onProgress(`✅ ${items.length} ردیف از عکس خونده شد، در حال اعمال سود...`);
     return items
       .filter(it => it && it.name && typeof it.price === "number" && it.price > 0)
       .map(it => ({
@@ -228,7 +248,8 @@ async function ocrImageToItems(apiKey, imageBytes) {
         color: it.color ? String(it.color).trim() : "",
         price: Math.round(it.price),
       }));
-  } catch {
+  } catch (parseErr) {
+    if (onProgress) await onProgress(`⛔ نتونستم جواب رو JSON بخونم: ${parseErr.message}\nمتن خام: ${text.slice(0, 300)}`);
     return [];
   }
 }
@@ -389,9 +410,13 @@ async function handleUpdate(env, update) {
     await tgSendMessage(token, chatId, `در حال خوندن ${session.photos.length} عکس... ⏳`);
 
     let allItems = [];
+    let photoIndex = 0;
     for (const fileId of session.photos) {
+      photoIndex++;
+      await tgSendMessage(token, chatId, `📥 در حال دانلود عکس ${photoIndex} از ${session.photos.length} از تلگرام...`);
       const bytes = await tgDownloadFile(token, fileId);
-      const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes);
+      const onProgress = (msg) => tgSendMessage(token, chatId, `[عکس ${photoIndex}] ${msg}`);
+      const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes, onProgress);
       allItems = allItems.concat(items);
     }
     allItems = dedupeItems(allItems);
