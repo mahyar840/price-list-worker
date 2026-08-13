@@ -223,9 +223,27 @@ async function ocrImageToItems(apiKey, imageBytes, onProgress) {
   }
   clearTimeout(timeoutId);
   if (onProgress) await onProgress(`جواب از Gemini رسید (کد وضعیت: ${res.status}) ⏳ در حال پردازش...`);
-  const data = await res.json();
+  let data = await res.json();
+  let retries = 0;
+  while (data.error && (data.error.code === 503 || data.error.code === 429) && retries < 2) {
+    retries++;
+    if (onProgress) await onProgress(`⏳ سرور Gemini شلوغه (کد ${data.error.code})، ${retries === 1 ? 3 : 6} ثانیه صبر می‌کنم و دوباره امتحان می‌کنم... (تلاش ${retries} از ۲)`);
+    await new Promise(r => setTimeout(r, retries === 1 ? 3000 : 6000));
+    const retryRes = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: OCR_SYSTEM_PROMPT }, { inline_data: { mime_type: "image/png", data: b64 } }] }],
+          generationConfig: { maxOutputTokens: 8192 },
+        }),
+      }
+    );
+    data = await retryRes.json();
+  }
   if (data.error) {
-    if (onProgress) await onProgress(`⛔ Gemini خطا داد: ${JSON.stringify(data.error).slice(0, 300)}`);
+    if (onProgress) await onProgress(`⛔ Gemini خطا داد (بعد از ${retries} بار تلاش مجدد): ${JSON.stringify(data.error).slice(0, 300)}`);
     return [];
   }
   let text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
@@ -407,13 +425,19 @@ async function handleUpdate(env, update) {
       await tgSendMessage(token, chatId, "هنوز عکسی نفرستادی.");
       return;
     }
-    await tgSendMessage(token, chatId, `در حال خوندن ${session.photos.length} عکس... ⏳`);
+    const photosToProcess = session.photos;
+    // Clear the queue IMMEDIATELY, before processing starts. This way, even
+    // if this run gets killed partway through (e.g. platform time limit),
+    // old photos never pile up for the next attempt -- resend if needed.
+    session.photos = [];
+    await setSession(chatId, session);
+    await tgSendMessage(token, chatId, `در حال خوندن ${photosToProcess.length} عکس... ⏳`);
 
     let allItems = [];
     let photoIndex = 0;
-    for (const fileId of session.photos) {
+    for (const fileId of photosToProcess) {
       photoIndex++;
-      await tgSendMessage(token, chatId, `📥 در حال دانلود عکس ${photoIndex} از ${session.photos.length} از تلگرام...`);
+      await tgSendMessage(token, chatId, `📥 در حال دانلود عکس ${photoIndex} از ${photosToProcess.length} از تلگرام...`);
       const bytes = await tgDownloadFile(token, fileId);
       const onProgress = (msg) => tgSendMessage(token, chatId, `[عکس ${photoIndex}] ${msg}`);
       const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes, onProgress);
@@ -423,8 +447,6 @@ async function handleUpdate(env, update) {
 
     if (!allItems.length) {
       await tgSendMessage(token, chatId, "هیچ کالای موجودی استخراج نشد.");
-      session.photos = [];
-      await setSession(chatId, session);
       return;
     }
 
@@ -437,8 +459,14 @@ async function handleUpdate(env, update) {
     if (dropped) caption += `\n⚠️ ${dropped} مورد به‌خاطر کمبود جا تو باکس‌های قالب حذف شد.`;
 
     await tgSendPhoto(token, chatId, png, caption);
+    return;
+  }
+
+  if (msg.text === "/clear") {
+    const session = await getSession(chatId);
     session.photos = [];
     await setSession(chatId, session);
+    await tgSendMessage(token, chatId, "صف عکس‌ها پاک شد. می‌تونی از اول عکس بفرستی.");
     return;
   }
 
