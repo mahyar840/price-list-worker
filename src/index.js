@@ -211,8 +211,10 @@ async function ocrImageToItems(apiKey, imageBytes) {
     }
   );
   const data = await res.json();
+  console.log("GEMINI RAW RESPONSE:", JSON.stringify(data).slice(0, 2000));
   let text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
   text = text.trim();
+  console.log("GEMINI EXTRACTED TEXT:", text.slice(0, 500));
   if (text.startsWith("```")) {
     text = text.replace(/^```[a-z]*\n?/, "").replace(/```$/, "").trim();
   }
