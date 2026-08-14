@@ -316,59 +316,47 @@ function layoutItemsIntoBoxes(items) {
   return { placedBoxes, dropped, uncategorized };
 }
 
-async function renderPriceListPng(env, items) {
-  const [fontRegular, fontBold, templateUri] = await Promise.all([
-    loadFont(env, false), loadFont(env, true), loadTemplateDataUri(env),
-  ]);
-
+function buildHtml(env, items) {
   const { placedBoxes, dropped, uncategorized } = layoutItemsIntoBoxes(items);
 
-  const rowChildren = [];
-  for (const box of placedBoxes) {
-    box.rows.forEach((it, i) => {
-      const top = box.y0 + BOX_PAD / 2 + i * ROW_H;
-      rowChildren.push({
-        type: "div",
-        props: {
-          style: {
-            position: "absolute", top, left: box.x0 + 6, right: TEMPLATE_W - box.x1 + 6,
-            display: "flex", justifyContent: "space-between", height: ROW_H,
-            fontSize: FONT_SIZE, color: "#1B1F2A",
-          },
-          children: [
-            { type: "div", props: { children: `${it.price.toLocaleString("en-US")}`, style: { fontWeight: 700 } } },
-            { type: "div", props: { children: it.color ? `${it.color}` : "", style: { color: "#6B6F7A" } } },
-            { type: "div", props: { children: it.name } },
-          ],
-        },
-      });
-    });
-  }
+  const rowsHtml = placedBoxes.map(box => box.rows.map((it, i) => {
+    const top = box.y0 + BOX_PAD / 2 + i * ROW_H;
+    return `<div class="row" style="top:${top}px; left:${box.x0 + 6}px; right:${TEMPLATE_W - box.x1 + 6}px;">
+      <div class="price">${it.price.toLocaleString("en-US")}</div>
+      <div class="color">${htmlEscape(it.color || "")}</div>
+      <div class="name">${htmlEscape(it.name)}</div>
+    </div>`;
+  }).join("\n")).join("\n");
 
-  const tree = {
-    type: "div",
-    props: {
-      style: { position: "relative", width: TEMPLATE_W, height: TEMPLATE_H, fontFamily: "Vazirmatn" },
-      children: [
-        { type: "img", props: { src: templateUri, width: TEMPLATE_W, height: TEMPLATE_H, style: { position: "absolute", top: 0, left: 0 } } },
-        ...rowChildren,
-      ],
-    },
-  };
+  const html = `<!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><style>
+    @font-face { font-family: 'Vazirmatn'; src: url('${env.FONT_URL_REGULAR}'); font-weight: 400; }
+    @font-face { font-family: 'Vazirmatn'; src: url('${env.FONT_URL_BOLD}'); font-weight: 700; }
+    * { box-sizing: border-box; }
+    body { margin: 0; width: ${TEMPLATE_W}px; height: ${TEMPLATE_H}px; position: relative; font-family: 'Vazirmatn', sans-serif; }
+    .bg { position: absolute; top: 0; left: 0; width: ${TEMPLATE_W}px; height: ${TEMPLATE_H}px; }
+    .row { position: absolute; display: flex; justify-content: space-between; align-items: center; height: ${ROW_H}px; font-size: ${FONT_SIZE}px; color: #1B1F2A; gap: 6px; }
+    .price { font-weight: 700; white-space: nowrap; }
+    .color { color: #6B6F7A; white-space: nowrap; }
+    .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  </style></head><body>
+    <img class="bg" src="${env.TEMPLATE_URL}" />
+    ${rowsHtml}
+  </body></html>`;
 
-  const svg = await satori(tree, {
-    width: TEMPLATE_W,
-    height: TEMPLATE_H,
-    fonts: [
-      { name: "Vazirmatn", data: fontRegular, weight: 400, style: "normal" },
-      { name: "Vazirmatn", data: fontBold, weight: 700, style: "normal" },
-    ],
-  });
+  return { html, dropped, uncategorized };
+}
 
-  await ensureResvgInit();
-  const resvg = new Resvg(svg, { fitTo: { mode: "width", value: TEMPLATE_W * 2 } });
-  const pngData = resvg.render();
-  return { png: pngData.asPng(), dropped, uncategorized };
+async function renderPriceListPng(env, items, onProgress) {
+  const { html, dropped, uncategorized } = buildHtml(env, items);
+  const step = async (label, fn) => { if (onProgress) await onProgress(label); return fn(); };
+  const browser = await step("launching browser...", () => puppeteer.launch(env.MYBROWSER));
+  const page = await step("new page...", () => browser.newPage());
+  await step("set viewport...", () => page.setViewport({ width: TEMPLATE_W, height: TEMPLATE_H }));
+  await step("set content...", () => page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 }));
+  await step("waiting fonts...", () => page.evaluate(() => document.fonts.ready));
+  const buf = await step("screenshot...", () => page.screenshot({ type: "png" }));
+  await browser.close();
+  return { png: buf, dropped, uncategorized };
 }
 
 // ---------------------------------------------------------------------------
@@ -417,32 +405,36 @@ async function handleUpdate(env, update) {
     await setSession(chatId, session);
     await tgSendMessage(token, chatId, `در حال خوندن ${photosToProcess.length} عکس... ⏳`);
 
-    let allItems = [];
-    let photoIndex = 0;
-    for (const fileId of photosToProcess) {
-      photoIndex++;
-      await tgSendMessage(token, chatId, `📥 در حال دانلود عکس ${photoIndex} از ${photosToProcess.length} از تلگرام...`);
-      const bytes = await tgDownloadFile(token, fileId);
-      const onProgress = (msg) => tgSendMessage(token, chatId, `[عکس ${photoIndex}] ${msg}`);
-      const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes, onProgress);
-      allItems = allItems.concat(items);
+    try {
+      let allItems = [];
+      let photoIndex = 0;
+      for (const fileId of photosToProcess) {
+        photoIndex++;
+        await tgSendMessage(token, chatId, `📥 در حال دانلود عکس ${photoIndex} از ${photosToProcess.length} از تلگرام...`);
+        const bytes = await tgDownloadFile(token, fileId);
+        const onProgress = (msg) => tgSendMessage(token, chatId, `[عکس ${photoIndex}] ${msg}`);
+        const items = await ocrImageToItems(env.GEMINI_API_KEY, bytes, onProgress);
+        allItems = allItems.concat(items);
+      }
+      allItems = dedupeItems(allItems);
+
+      if (!allItems.length) {
+        await tgSendMessage(token, chatId, "هیچ کالای موجودی استخراج نشد.");
+        return;
+      }
+
+      const margin = session.margin ?? defaultMargin;
+      const priced = applyMargin(allItems, margin);
+      const { png, dropped, uncategorized } = await renderPriceListPng(env, priced, (m) => tgSendMessage(token, chatId, `🖼️ ${m}`));
+
+      let caption = `لیست آماده شد (سود ${margin}%)`;
+      if (uncategorized) caption += `\n⚠️ ${uncategorized} مورد به هیچ دسته‌ی قالب نخورد و رد شد.`;
+      if (dropped) caption += `\n⚠️ ${dropped} مورد به‌خاطر کمبود جا تو باکس‌های قالب حذف شد.`;
+
+      await tgSendPhoto(token, chatId, png, caption);
+    } catch (err) {
+      await tgSendMessage(token, chatId, `⛔ خطای کلی: ${err.message}\n${(err.stack || "").slice(0, 500)}`);
     }
-    allItems = dedupeItems(allItems);
-
-    if (!allItems.length) {
-      await tgSendMessage(token, chatId, "هیچ کالای موجودی استخراج نشد.");
-      return;
-    }
-
-    const margin = session.margin ?? defaultMargin;
-    const priced = applyMargin(allItems, margin);
-    const { png, dropped, uncategorized } = await renderPriceListPng(env, priced);
-
-    let caption = `لیست آماده شد (سود ${margin}%)`;
-    if (uncategorized) caption += `\n⚠️ ${uncategorized} مورد به هیچ دسته‌ی قالب نخورد و رد شد.`;
-    if (dropped) caption += `\n⚠️ ${dropped} مورد به‌خاطر کمبود جا تو باکس‌های قالب حذف شد.`;
-
-    await tgSendPhoto(token, chatId, png, caption);
     return;
   }
 
