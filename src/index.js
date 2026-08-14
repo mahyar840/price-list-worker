@@ -10,16 +10,7 @@
  * on every request -- see README.md for why.
  */
 
-import satori from "satori";
-import { Resvg, initWasm } from "@resvg/resvg-wasm";
-import resvgWasm from "@resvg/resvg-wasm/index_bg.wasm";
-
-let resvgReady = false;
-async function ensureResvgInit() {
-  if (resvgReady) return;
-  await initWasm(resvgWasm);
-  resvgReady = true;
-}
+import puppeteer from "@cloudflare/puppeteer";
 
 // ---------------------------------------------------------------------------
 // Jalali date
@@ -286,23 +277,16 @@ function applyMargin(items, marginPercent) {
 }
 
 // ---------------------------------------------------------------------------
-// Render step -- overlay text on the fixed template image via satori+resvg
+// Render step -- build an HTML page overlaying the data on the fixed
+// template image, then screenshot it with Cloudflare's Browser Rendering
+// (a real headless browser). Rendering happens on Cloudflare's separate
+// browser infrastructure -- our Worker just waits for the result, which is
+// network I/O, not CPU time, so it dodges the 10ms free-plan CPU cap that
+// killed the old satori/resvg approach.
 // ---------------------------------------------------------------------------
-// No KV cache here anymore -- just fetched fresh each cold start. A Worker
-// isolate stays warm for many requests in a row, so this only costs a bit
-// of extra time occasionally, not on every single message.
 
-async function loadFont(env, bold) {
-  const url = bold ? env.FONT_URL_BOLD : env.FONT_URL_REGULAR;
-  const res = await fetch(url);
-  return res.arrayBuffer();
-}
-
-async function loadTemplateDataUri(env) {
-  const res = await fetch(env.TEMPLATE_URL);
-  const buf = await res.arrayBuffer();
-  const b64 = bytesToBase64(new Uint8Array(buf));
-  return `data:image/png;base64,${b64}`;
+function htmlEscape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 function layoutItemsIntoBoxes(items) {
@@ -470,10 +454,14 @@ async function handleUpdate(env, update) {
     return;
   }
 
-  if (msg.photo && msg.photo.length) {
-    const best = msg.photo[msg.photo.length - 1];
+  // Photos sent normally (compressed) come in msg.photo. Photos sent as a
+  // "file/document" (uncompressed, full quality) come in msg.document instead
+  // -- Telegram treats these as two different message types.
+  const isImageDocument = msg.document && msg.document.mime_type && msg.document.mime_type.startsWith("image/");
+  if ((msg.photo && msg.photo.length) || isImageDocument) {
+    const fileId = isImageDocument ? msg.document.file_id : msg.photo[msg.photo.length - 1].file_id;
     const session = await getSession(chatId);
-    session.photos.push(best.file_id);
+    session.photos.push(fileId);
     await setSession(chatId, session);
     await tgSendMessage(token, chatId, `عکس دریافت شد (${session.photos.length} عکس تو صف). وقتی تموم شد /generate رو بزن.`);
     return;
